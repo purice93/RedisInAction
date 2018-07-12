@@ -1,3 +1,8 @@
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
 import org.javatuples.Pair;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Pipeline;
@@ -5,9 +10,14 @@ import redis.clients.jedis.Transaction;
 import redis.clients.jedis.Tuple;
 import redis.clients.jedis.ZParams;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
 import java.text.Collator;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -40,20 +50,238 @@ public class Chapter05 {
         conn.select(15);
 
         // 测试1：redis记录日志
-        testLogRecent(conn);
-        testLogCommon(conn);
+//        testLogRecent(conn);
+//        testLogCommon(conn);
 
         // 测试2：计数器和统计数据
-        testCounters(conn);
-        testStats(conn);
-        testAccessTime(conn);
-        testIpLookup(conn);
+//        testCounters(conn);
+//        testStats(conn);
+//        testAccessTime(conn);
+//        testIpLookup(conn);
 //        testIsUnderMaintenance(conn);
-//        testConfig(conn);
+        testConfig(conn);
+    }
+
+    private void testConfig(Jedis conn) throws InterruptedException {
+        System.out.println("首先，创建一个配置文件map：");
+        Map<String, Object> config = new HashMap<String, Object>();
+        config.put("db", 15);
+        // 添加到redis中
+        setConfig(conn, "redis", "test", config);
+        Jedis conn2 = redisConnection("test");
+        System.out.println("新的连接是否存在：" + (conn2.info() != null));
+    }
+
+    private static final Map<String, Jedis> REDIS_CONNECTIONS = new HashMap<String, Jedis>();
+    private static final Map<String, Map<String, Object>> CONFIGS =
+            new HashMap<String, Map<String, Object>>();
+    private static final Map<String, Long> CHECKED = new HashMap<String, Long>();
+
+    private Jedis redisConnection(String component) {
+        Jedis configConn = REDIS_CONNECTIONS.get("config");
+        if (configConn == null) {
+            configConn = new Jedis("localhost");
+            configConn.select(15);
+            REDIS_CONNECTIONS.put("config", configConn);
+        }
+        String key = "config:redis:" + component;
+        Map<String, Object> oldConfig = CONFIGS.get(key);
+        Map<String, Object> newConfig = getConfig(configConn, "redis", component);
+        // 判断配置文件是否相等，不相等，更改当前配置文件
+        if (!newConfig.equals(oldConfig)) {
+            Jedis conn = new Jedis("localhost");
+            conn.select(((Double) newConfig.get("db")).intValue());
+            REDIS_CONNECTIONS.put(key, conn);
+        }
+        return REDIS_CONNECTIONS.get(key);
+    }
+
+    /**
+     * 从redis获取新的配置文件，与当前程序中的配置文件CONFIGS对比
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> getConfig(Jedis conn, String type, String component) {
+        String key = "config:" + type + ":" + component;
+        long wait = 1000;
+        if (CHECKED.get(key) == null || CHECKED.get(key) < System.currentTimeMillis() - wait) {
+            CHECKED.put(key, System.currentTimeMillis());
+            String value = conn.get(key);
+            Map<String, Object> config = null;
+            if (value != null) {
+                Gson gson = new Gson();
+                config = (Map<String, Object>) gson.fromJson(value, new TypeToken<Map<String, Object>>() {
+                }.getType());
+            } else {
+                config = new HashMap<String, Object>();
+            }
+            CONFIGS.put(key, config);
+        }
+        return CONFIGS.get(key);
+    }
+
+    private void setConfig(Jedis conn, String type, String component, Map<String, Object> config) {
+        Gson gson = new Gson();
+        conn.set("config:" + type + ":" + component, gson.toJson(config));
+    }
+
+    private void testIsUnderMaintenance(Jedis conn) throws InterruptedException {
+        boolean flag = false;
+        flag = isUnderMaintenance(conn);
+        System.out.println("是否在维护:" + flag);
+        conn.set("is-under-maintenance", "yes");
+        flag = isUnderMaintenance(conn);
+        System.out.println("改变后，是否在维护:" + flag);
+        Thread.sleep(1000);
+        flag = isUnderMaintenance(conn);
+        System.out.println("停留1秒钟，是否在维护:" + flag);
+
+        conn.del("is-under-maintenance");
+        Thread.sleep(1000);
+        flag = isUnderMaintenance(conn);
+        System.out.println("清除后，是否在维护:" + flag);
+
+    }
+
+
+    private long lastChecked;
+    private boolean underMaintenance;
+
+    private boolean isUnderMaintenance(Jedis conn) {
+        if (lastChecked < System.currentTimeMillis() - 1000) {
+            String flag = conn.get("is-under-maintenance");
+            underMaintenance = "yes".equals(flag);
+        }
+        return underMaintenance;
     }
 
     private void testIpLookup(Jedis conn) {
+        String cwd = System.getProperty("user.dir");
+        File blocks = new File(cwd + "/GeoLiteCity-Blocks.csv");
+        File locations = new File(cwd + "/GeoLiteCity-Location.csv");
+        if (!blocks.exists()) {
+            System.out.println("文件不存在：" + blocks);
+        }
+        if (!locations.exists()) {
+            System.out.println("文件不存在：" + locations);
+        }
+        System.out.println("将IP数据载入到redis：");
+//        importIpsToRedis(conn, blocks);
+        long ipSum = conn.zcard("ip2cityId:");
+        System.out.println("IP数量为：" + ipSum);
 
+        System.out.println("将城市数据载入redis：");
+//        importCitiesToRedis(conn, locations);
+        long citySum = conn.hlen("cityId2City:");
+        System.out.println("城市数量为：" + citySum);
+
+
+        System.out.println("随机查找ip");
+        for (int i = 0; i < 5; i++) {
+            String ip = randomOctet(255) + "."
+                    + randomOctet(256) + "."
+                    + randomOctet(256) + "."
+                    + randomOctet(256);
+            String cityMessage = Arrays.toString(findCityByIp(conn, ip));
+            System.out.println("所在城市信息为：");
+            System.out.println(cityMessage);
+        }
+    }
+
+    private void importCitiesToRedis(Jedis conn, File file) {
+        FileReader reader = null;
+        Gson gson = new Gson();
+        try {
+            reader = new FileReader(file);
+            CSVParser parser = new CSVParser(reader, CSVFormat.DEFAULT);
+            for (CSVRecord record : parser) {
+                if (record.size() < 4 || !Character.isDigit(record.get(0).charAt(0))) {
+                    continue;
+                }
+                String cityId = record.get(0);
+
+                String country = record.get(1);
+                String region = record.get(2);
+                String city = record.get(3);
+                String postalCode = record.get(4);
+                String latitude = record.get(5);
+                String longitude = record.get(6);
+                String metroCode = record.get(7);
+                String areaCode = record.get(8);
+                String json = gson.toJson(new String[]{
+                        country, region, city, postalCode, latitude, longitude, metroCode, areaCode
+                });
+                conn.hset("cityId2City:", cityId, json);
+            }
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                reader.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private String[] findCityByIp(Jedis conn, String ipAddress) {
+        long score = ipToScore(ipAddress);
+        Set<String> rangs = conn.zrevrangeByScore("ip2cityId:", score, 0, 0, 1);
+        if (rangs.size() == 0) {
+            return null;
+        }
+        String cityId = rangs.iterator().next();
+        cityId = cityId.substring(0, cityId.indexOf("_"));
+        return new Gson().fromJson(conn.hget("cityId2City:", cityId), String[].class);
+    }
+
+    private String randomOctet(int max) {
+        return String.valueOf((int) (Math.random() * max));
+    }
+
+    private void importIpsToRedis(Jedis conn, File file) {
+        FileReader fileReader = null;
+        try {
+            int number = 0;
+            fileReader = new FileReader(file);
+            CSVParser parser = new CSVParser(fileReader, CSVFormat.DEFAULT);
+            for (CSVRecord csvRecord : parser) {
+                String startIp = csvRecord.get(0);
+                if (startIp.toLowerCase().indexOf('i') != -1) {
+                    continue;
+                }
+                long score = 0;
+                if (startIp.indexOf('.') != -1) {
+                    score = ipToScore(startIp);
+                } else {
+                    score = Long.parseLong(startIp, 10);
+                }
+                System.out.println(number);
+                String cityIp = csvRecord.get(2) + "_" + number;
+                number++;
+                conn.zadd("ip2cityId:", score, cityIp);
+            }
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                fileReader.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private long ipToScore(String ipAddress) {
+        long score = 0;
+        // "."需要转义
+        for (String str : ipAddress.split("\\.")) {
+            score = score * 256 + Integer.parseInt(str, 10);
+        }
+        return score;
     }
 
     /**
@@ -69,9 +297,9 @@ public class Chapter05 {
             timer.stop("request-" + i);
         }
         System.out.println("输出所有的分数，只缓存最多的100个：");
-        Set<Tuple> stats = conn.zrangeWithScores("slowest:AccessTime",0,-1);
-        for (Tuple tuple:stats){
-            System.out.println(tuple.getElement()+" -- "+tuple.getScore());
+        Set<Tuple> stats = conn.zrangeWithScores("slowest:AccessTime", 0, -1);
+        for (Tuple tuple : stats) {
+            System.out.println(tuple.getElement() + " -- " + tuple.getScore());
         }
 
     }
@@ -91,7 +319,7 @@ public class Chapter05 {
     private HashMap<String, Double> getStats(Jedis conn, String context, String type) {
         String keys = "stats:" + context + ":" + type;
         Set<Tuple> datas = conn.zrangeWithScores(keys, 0, -1);
-        HashMap<String, Double> stats = new HashMap<>();
+        HashMap<String, Double> stats = new HashMap<String, Double>();
         for (Tuple tuple : datas) {
             stats.put(tuple.getElement(), tuple.getScore());
         }
@@ -395,14 +623,14 @@ public class Chapter05 {
 
         /**
          * 记录停留时间-即类似执行时间
-          */
+         */
         public void stop(String context) {
             long delta = System.currentTimeMillis() - start;
             List<Object> stats = updateState(conn, context, "AccessTime", delta / 1000);
-            double average = (double) stats.get(1)/(double) stats.get(0);
+            double average = (Double) stats.get(1) / (Double) stats.get(0);
             Transaction trans = conn.multi();
-            trans.zadd("slowest:AccessTime",average,context);
-            trans.zremrangeByRank("slowest:AccessTime",0,-101);
+            trans.zadd("slowest:AccessTime", average, context);
+            trans.zremrangeByRank("slowest:AccessTime", 0, -101);
             trans.exec();
         }
     }
